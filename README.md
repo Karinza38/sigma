@@ -158,7 +158,12 @@ optional arguments:
 ### Examples
 
 ### CyberOwl Sysmon Parser
+Translate a single sigma rule to a sysmon config
+```
 python tools/sigmac {sigma rule .yml file} -t sysmon -c sysmon -or {output folder}
+```
+
+Translate sigma rules to sysmon configs
 ```
 python tools/sigmac -r {sigma rule folder} -t sysmon -c sysmon -or {output folder}
 ```
