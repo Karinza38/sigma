@@ -1,38 +1,47 @@
 import re
-
 import sigma
 from sigma.backends.base import SingleTextQueryBackend
 from sigma.backends.mixins import MultiRuleOutputMixin
+from sigma.parser.condition import ConditionOR, ConditionAND, NodeSubexpression, SigmaAggregationParser, SigmaConditionParser, SigmaConditionTokenizer, dumpNode, ConditionNOT
+from sigma.parser.modifiers.type import SigmaRegularExpressionModifier
+from yaml.nodes import Node
+
 
 from .exceptions import NotSupportedError
 
+#python tools/sigmac $RULE -t sysmon -c sysmon -d
 
 class SysmonConfigBackend(SingleTextQueryBackend, MultiRuleOutputMixin):
     """Converts Sigma rule into sysmon XML configuration"""
     identifier = "sysmon"
     active = True
-    andToken = " AND "
-    orToken = " OR "
-    notToken = "NOT "
-    subExpression = "(%s)"
     config_required = True
-    INCLUDE = "include"
-    EXCLUDE = "exclude"
-    conditionDict = {
-        "startswith": "begin with",
-        "endswith": "end with",
-        "all": "contains all"
-    }
+
 
     def __init__(self, *args, **kwargs):
         self.table = None
         self.logsource = None
         self.allowedSource = {
-            "process_creation": "ProcessCreate"
+            "process_creation": "ProcessCreate",
+            "file_change":"FileCreateTime",
+            "network_connection":"NetworkConnect",
+            "process_termination":"ProcessTerminate",
+            "driver_load":"DriverLoad",
+            "image_load":"ImageLoad",
+            "create_remote_thread":"CreateRemoteThread",
+            "raw_access_thread":"RawAccessRead",
+            "process_access":"ProcessAccess",
+            "file_event":"FileCreate",
+            "registry_event":"RegistryEvent",
+            "create_stream_hash":"FileCreateStreamHash",
+            "pipe_created":"PipeEvent",
+            "wmi_event":"WmiEvent",
+            "dns_query":"DnsQuery",
+            "process_tampering":"ProcessTampering"
         }
+
         self.eventidTagMapping = {
             1: "ProcessCreate",
-            4799: "ProcessCreate",
             2: "FileCreateTime",
             3: "NetworkConnect",
             5: "ProcessTerminate",
@@ -55,197 +64,262 @@ class SysmonConfigBackend(SingleTextQueryBackend, MultiRuleOutputMixin):
             257: "DNSQuery",
             23: "FileDelete"
         }
-        self.allowedCondCombinations = {
-            'single': [
-                [4],
-                [1, 4],
-                [2, 4],
-            ],
-            'multi': [
-                [1, 2, 4],
-            ],
-            "exclude": [
-                [1, 3, 4],
-                [2, 3, 4]
-            ],
-            # "multi-exclude": [
-            #     [1, 2, 3, 4]
-            # ]
-        }
+        
+        self.rules = []
+        self.event_id = []
         return super().__init__(*args, **kwargs)
 
-    def cleanValue(self, value):
-        val = re.sub("[*]", "", value)
-        return val
+    def traverse_tree(self,node,indent=''):
+        if hasattr(node, 'items'):
+            #if current node is ConditionNot then return
+            # print("%s%s<%s>" % (indent, type(node).__name__,
+            #                     type(node.items).__name__))
+            if type(node) == ConditionNOT:
+                return
+            if type(node) == ConditionAND:
+                if type(node.items) == list:
+                    self.extract_include_and_rules(node.items)
+            if type(node) == ConditionOR:
+                if type(node.items) == list:
+                    self.extract_include_or_rules(node.items)
+                    pass
 
-    def mapFiledValue(self, field, value):
-        condition = None
-        any_selector = "contains any"
-        if "|" in field:
-            field, *pipes = field.split("|")
-            if len(pipes) == 1:
-                modifier = pipes[0]
-                if modifier in self.conditionDict:
-                    condition = self.conditionDict[modifier]
-                if modifier == "all":
-                    any_selector = "contains all"
+            if type(node.items) != list:
+                self.traverse_tree(node.items, indent + '  ')
             else:
-                raise NotImplementedError("not implemented condition")
-        if isinstance(value, list) and len(value) > 1:
-            condition = any_selector
-            value = ";".join(value)
-        elif "*" in value:
-            if value.startswith("*") and value.endswith("*"):
-                condition = "contains"
-            elif value.startswith("*"):
-                condition = "end with"
-            elif value.endswith("*"):
-                condition = "begin with"
+                for item in node.items:
+                    self.traverse_tree(item, indent + '  ')
+        else:
+            # self.extract_include_rules(node)
+            pass
+            # print("%s%s=%s" % (indent, type(node).__name__,
+            #                         repr(node)))
+        return ''
+
+    def dumpNode(node, indent=''):   # pragma: no cover
+        """
+        Recursively print the AST rooted at *node* for debugging.
+        """
+        if hasattr(node, 'items'):
+            print("%s%s<%s>" % (indent, type(node).__name__,
+                                type(node.items).__name__))
+            if type(node.items) != list:
+                dumpNode(node.items, indent + '  ')
             else:
-                condition = "contains"
-
-        if condition:
-            field_str = '<{field} condition="{condition}">{value}</{field}>'.format(field=field,
-                                                                                    condition=condition,
-                                                                                    value=self.cleanValue(value))
+                for item in node.items:
+                    dumpNode(item, indent + '  ')
         else:
-            field_str = '<{field}>{value}</{field}>'.format(field=field, value=self.cleanValue(value))
+            print("%s%s=%s" % (indent, type(node).__name__,
+                                    repr(node)))
+        return node 
 
-        return field_str
+    def extract_include_or_rules(self,node):
+        sub_expression = dict()
+        # if list, it's an AND
+        if isinstance(node,list):
+            for item in node:
+                if type(item)==tuple:
+                    field = item[0]
+                    values = item[1]
+                    #Change values to a list to iterate over
+                    #If value is None, skip current iteration
+                    if values == None:
+                        continue
+                    if not isinstance(item[1],list):
+                        values = [item[1]]
 
-    def createRule(self, selections):
-        fields_list = []
-        table = None
-        for field, value in selections.items():
-            if isinstance(value, list) and len(value) == 1:
-                value = value[0]
-            if field == "EventID":
-                try:
-                    table = self.eventidTagMapping[value]
-                except KeyError:
-                    table = self.eventidTagMapping[1]
-            else:
-                created_field_value = self.mapFiledValue(field, value)
-                fields_list.append(created_field_value)
-        fields_list_filtered = [item for item in fields_list if item]
-        if any(fields_list_filtered):
-            rule = '''\n\t\t<Rule name="{rule_name}" groupRelation="and">\n\t\t\t{fields}\n\t\t</Rule>'''.format(rule_name=self.rule_name, fields="\n\t\t\t".join(["{}".format(item) for item in fields_list_filtered]))
-            t = table if table else self.table
-            return rule, t
-        else:
-            return None, None
-
-    def createRuleGroup(self, condition_objects, condition, match_type="include"):
-        rules = None
-        rules_selections = [item for item in condition_objects if item.type == 4]
-        if len(rules_selections) == 1:
-            rule, table = self.createRule(self.detection.get(rules_selections[0].matched))
-            rules = {match_type: {table: rule}}
-        else:
-            if "or" in condition.lower():
-                result = {}
-                for selection_object in rules_selections:
-                    rule, table = self.createRule(self.detection.get(selection_object.matched))
-                    if result.get(table):
-                        result[table].append(rule)
+                    if field == 'EventID':
+                        self.event_id = values
                     else:
-                        result[table] = [rule]
-                result = {table_name: "\n\t\t".join(rules_list) for table_name, rules_list in result.items()}
-                rules = {match_type: result}
-            elif "and" in condition.lower():
-                rules_dict = {}
-                for selection_object in rules_selections:
-                    rules_dict.update(self.detection.get(selection_object.matched))
-                rule, table = self.createRule(rules_dict)
-                rules = {match_type: {table: rule}}
-        if rules:
-            rules_result = []
-            for match, tables in rules.items():
-                for table, rules in tables.items():
-                    category_comment = '\n<!--Insert This Rule in <{} onmatch="{}"> section -->\n{}'.format(table, match,
-                                                                                                            "".join(rules))
-                    rules_result.append(category_comment)
-            return "".join(rules_result)
-        else:
-            raise NotSupportedError("Couldn't create rule with current condition.")
+                        if not isinstance(item[1],list):
+                            values = [item[1]]
 
-    def createMultiRuleGroup(self, conditions):
-        conditions_id = "".join([str(item.type) for item in conditions])
-        or_index = conditions_id.index("2")
-        sorted_conditions = [conditions[:or_index], conditions[or_index+1:]]
-        if sorted_conditions:
-            result = ""
-            for rule_condition in sorted_conditions:
-                rule = self.createRuleGroup(condition_objects=rule_condition, condition=" ".join([item.matched for item in rule_condition]))
-                result += "{}\n".format(rule)
-            return result
-        else:
-            raise NotSupportedError("Not implemented condition.")
+                        #Add in modifiers to fields and values
+                        contains = re.compile('^\*.*\*$')
+                        starts_with = re.compile('.*\*$')
+                        ends_with = re.compile('\*.*$')
+                        # ampersand = re.compile('&')
 
-    def createExcludeRuleGroup(self, conditions):
-        conditions_id = "".join([str(item.type) for item in conditions])
-        condition = self.detection.get("condition")
-        sorted_conditions = None
-        if "and not" in condition.lower():
-            andnot_index = conditions_id.index("13")
-            sorted_conditions = [(conditions[:andnot_index], self.INCLUDE), ([item for item in conditions if item.type != 3], self.EXCLUDE)]
-        elif "or not" in condition.lower():
-            ornot_index = conditions_id.index("23")
-            sorted_conditions = [(conditions[:ornot_index], self.INCLUDE), (conditions[ornot_index + 2:], self.EXCLUDE)]
-        if sorted_conditions:
-            result = ""
-            for rule_condition in sorted_conditions:
-                rule = self.createRuleGroup(condition_objects=rule_condition[0], condition=" ".join([item.matched for item in rule_condition[0]]), match_type=rule_condition[1])
-                result += "{}\n".format(rule)
-            return result
+                        modified_values = []
 
-    def checkRuleCondition(self, condtokens):
-        if len(condtokens) == 1:
-            conditions = [item for item in condtokens[0].tokens]
-            conditions_combination = list(set([item.type for item in conditions]))
-            for rule_type, combinations in self.allowedCondCombinations.items():
-                for combination in combinations:
-                    if sorted(conditions_combination) == sorted(combination):
-                        return rule_type, conditions
-            else:
-                raise NotSupportedError("Not supported condition.")
-        else:
-            raise NotSupportedError("Not supported condition.")
+                        #Check if contains or ends with modifier is present
+                        for value in values:
+                            if isinstance(value,SigmaRegularExpressionModifier):
+                                return
 
-    def createTableFromLogsource(self):
-        if self.logsource.get("product", "") != "windows":
-            raise NotSupportedError(
-                "Not supported logsource. Should be product `windows`.")
-        for item in self.logsource.values():
-            if str(item).lower() in self.allowedSource.keys():
-                self.table = self.allowedSource.get(item.lower())
-                break
-        else:
-            self.table = "ProcessCreate"
+                            #escape ampersand character in xml
+                            if type(value) is str:
+                                value = value.replace('&','&amp;')
+                            if contains.match(str(value)) or starts_with.match(str(value)):
+                                modified_field = field+'|contains'
+                                modified_values.append(value.replace('*',''))
+                                pass
+                            elif ends_with.match(str(value)):
+                                modified_field = field+'|end with'
+                                modified_values.append(value.replace('*',''))
+                                pass
+                            else:
+                                modified_field = field+'|is'
+                                modified_values.append(value)
+                                pass
 
-    def checkDetection(self):
-        for selection_name, value in self.detection.items():
-            if isinstance(value, list):
-                raise NotSupportedError("Keywords are not supported in sysmon backend.")
+                        #Check if it is contains all. If contains all is present, override previous modifier
+                        del_keys = []
+                        for key, value in sub_expression.items():
+                            if field.split("|")[0] == key.split("|")[0]:
+                                modified_field = field.split("|")[0]+'|contains any'
+                                modified_values = modified_values + value
+                                del_keys.append(key)
+                        
+                        #Delete keys that were aggregated by contains all
+                        if del_keys:
+                            for del_key in del_keys:
+                                del sub_expression[del_key]
 
+                        sub_expression[modified_field] = modified_values
+                        # print('modified_field',modified_field)
+                        # print('returned_values',modified_values)
+                        # print('sub expression',sub_expression)
+
+            if sub_expression:
+                # print('sub_expression',sub_expression)
+                self.rules.append(sub_expression)
+            
+    def extract_include_and_rules(self,node):
+
+        sub_expression = dict()
+
+        # if list, it's an AND
+        if isinstance(node,list):
+            for item in node:
+                if type(item)==tuple:
+                    field = item[0]
+                    values = item[1]
+                    #If value is None, skip current iteration
+                    if values == None:
+                        continue
+                    #Change values to a list to iterate over
+                    if not isinstance(item[1],list):
+                        values = [item[1]]
+
+                    if field == 'EventID':
+                        self.event_id = values
+                    else:
+                        #Add in modifiers to fields and values
+                        contains = re.compile('^\*.*\*$')
+                        starts_with = re.compile('.*\*$')
+                        ends_with = re.compile('\*.*$')
+
+                        modified_values = []
+
+                        #Check if contains or ends with modifier is present
+                        for value in values:
+                            if isinstance(value,SigmaRegularExpressionModifier):
+                                return
+
+                            #escape ampersand character in xml
+                            if type(value) is str:
+                                value = value.replace('&','&amp;')
+                            if contains.match(str(value)) or starts_with.match(str(value)):
+                                modified_field = field+'|contains'
+                                modified_values.append(value.replace('*',''))
+                                pass
+                            elif ends_with.match(str(value)):
+                                modified_field = field+'|end with'
+                                modified_values.append(value.replace('*',''))
+                                pass
+                            else:
+                                modified_field = field+'|is'
+                                modified_values.append(value)
+                                pass
+
+                        #Check if it is contains all. If contains all is present, override previous modifier
+                        del_keys = []
+                        for key, value in sub_expression.items():
+                            if field.split("|")[0] == key.split("|")[0]:
+                                modified_field = field.split("|")[0]+'|contains all'
+                                modified_values = modified_values + value
+                                del_keys.append(key)
+                        
+                        #Delete keys that were aggregated by contains all
+                        if del_keys:
+                            for del_key in del_keys:
+                                del sub_expression[del_key]
+
+                        #Only for and conditions. If subexpression has ends with as a list of more than one, change modifier to contains any
+                        if modified_field.split("|")[1] == 'end with' and len(modified_values)>1:
+                            modified_field = field.split("|")[0]+'|contains any'
+
+                        sub_expression[modified_field] = modified_values
+                        # print('modified_field',modified_field)
+                        # print('returned_values',modified_values)
+                        # print('sub expression',sub_expression)
+
+            if sub_expression:
+                self.rules.append(sub_expression)
+
+    def generate_sysmon_rules(self):
+        output = ''
+        #map event ID
+        event_id_tags = set()
+        #Some rules will have multiple event ids
+        #Iterate through event ids
+        for event_id in self.event_id:
+            #if event_id is not specified, return
+            if not self.eventidTagMapping.get(event_id):
+                return
+            event_id_tag = self.eventidTagMapping.get(event_id)
+            #store event_id_tag in tuple
+            event_id_tags.add(event_id_tag)
+
+        for event_id in event_id_tags:
+            
+            header = f'<Sysmon schemaversion="4.30">\n\t<EventFiltering>\n\t\t<RuleGroup name="" groupRelation="or">\n\t\t\t<{event_id} onmatch="include">\n'
+
+            footer = f'\t\t\t</{event_id}>\n\t\t</RuleGroup>\n\t</EventFiltering>\n</Sysmon>'
+
+            # print(header)
+            output += header
+
+            #Iterate through rules
+            for rule in self.rules:
+                if len(rule) > 1:
+                    output += '\t\t\t\t\t<Rule name="" groupRelation="and">\n'
+                    # print('\t\t\t\t\t<RuleGroup name="" groupRelation="and">')
+                    for field,values in rule.items():
+                        field_name = field.split('|')[0]
+                        field_modifier = field.split('|')[1]
+                        if field_modifier == "contains all" or field_modifier == "contains any":
+                            values = ';'.join(values)
+                            output += f'\t\t\t\t\t\t<{field_name} condition="{field_modifier}">{values}</{field_name}>\n'
+                            # print('\t\t\t\t\t\t',f'<{field_name} condition="{field_modifier}">',values,f'</{field_name}>')
+                        else:
+                            for value in values:
+                                output += f'\t\t\t\t\t\t<{field_name} condition="{field_modifier}">{value}</{field_name}>\n'
+                                # print('\t\t\t\t\t\t',f'<{field_name} condition="{field_modifier}">',value,f'</{field_name}>')
+                    output += '\t\t\t\t\t</Rule>\n'
+                    # print('\t\t\t\t\t</RuleGroup>')
+                else:
+                    for field,values in rule.items():
+                        field_name = field.split('|')[0]
+                        field_modifier = field.split('|')[1]
+                        if field_modifier == "contains all" or field_modifier == "contains any":
+                            values = ';'.join(values)
+                            output += f'\t\t\t\t\t<{field_name} condition="{field_modifier}">{values}</{field_name}>\n'
+                            # print(f'\t\t\t\t\t<{field_name} condition="{field_modifier}">',values,f'</{field_name}>')
+                        else:
+                            for value in values:
+                                output += f'\t\t\t\t\t<{field_name} condition="{field_modifier}">{value}</{field_name}>\n'
+                                # print(f'\t\t\t\t\t<{field_name} condition="{field_modifier}">',value,f'</{field_name}>')
+            pass
+            output += footer
+            self.rules = []
+            return output
 
     def generate(self, sigmaparser):
-        sysmon_rule = None
-        title = sigmaparser.parsedyaml.get("title", "")
-        author = sigmaparser.parsedyaml.get("author", {})
-        self.rule_name = "{} by {}".format(title, author)
-        self.detection = sigmaparser.parsedyaml.get("detection", {})
-        self.checkDetection()
-        self.logsource = sigmaparser.parsedyaml["logsource"]
-        self.createTableFromLogsource()
-        rule_type, conditions = self.checkRuleCondition(sigmaparser.condtoken)
-        if rule_type == "single":
-            sysmon_rule = self.createRuleGroup(conditions, self.detection.get("condition"))
-        elif rule_type == "multi":
-            sysmon_rule = self.createMultiRuleGroup(conditions)
-        elif rule_type == "exclude":
-            sysmon_rule = self.createExcludeRuleGroup(conditions)
-
-        if sysmon_rule:
-            rulegroup_comment = '<!--RuleGroup groupRelation should be `or` <RuleGroup groupRelation="or"> -->'
-            return "{}\n{}".format(rulegroup_comment, sysmon_rule)
+        for element in sigmaparser.condparsed:
+            self.traverse_tree(element.parsedSearch)
+        sysmon_config = self.generate_sysmon_rules()
+        
+        if sysmon_config:
+            return sysmon_config
