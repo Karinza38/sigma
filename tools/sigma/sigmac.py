@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import traceback
 import sys
 import argparse
 import yaml
@@ -61,6 +62,8 @@ ERR_FULL_FIELD_MATCH    = 90
 
 # Allowed fields in output
 allowed_fields = ["title", "id", "status", "description", "author", "references", "fields", "falsepositives", "level", "tags", "filename"]
+
+sigma_rules_error = []
 
 def alliter(path):
     for sub in path.iterdir():
@@ -113,6 +116,7 @@ def set_argparser():
     argparser.add_argument("--lists", "-l", action="store_true", help="List available output target formats and configurations")
     argparser.add_argument("--config", "-c", action="append", help="Configurations with field name and index mapping for target environment. Multiple configurations are merged into one. Last config is authoritative in case of conflicts.")
     argparser.add_argument("--output", "-o", default=None, help="Output file or filename prefix (if end with a '_','/' or '\\')")
+    argparser.add_argument("--output-folder", "-or", default=None, help="Output to specified folder")
     argparser.add_argument("--output-fields", "-of", help="""Enhance your output with additional fields from the Sigma rule (not only the converted rule itself). 
     Select the fields you want by providing their list delimited with commas (no space). Only work with the '--output-format' option and with 'json' or 'yaml' value.
     available additional fields : title, id, status, description, author, references, fields, falsepositives, level, tags.
@@ -206,6 +210,7 @@ def main():
         for conf_name in cmdargs.config:
             try:
                 sigmaconfig = scm.get(conf_name)
+                print(sigmaconfig.order)
                 if sigmaconfig.order is not None:
                     if sigmaconfig.order <= order and not cmdargs.shoot_yourself_in_the_foot:
                         print("The configurations were provided in the wrong order (order key check in config file)", file=sys.stderr)
@@ -247,6 +252,7 @@ def main():
     
     filename_ext = cmdargs.output_extention
     filename = cmdargs.output
+    folder = cmdargs.output_folder
     fileprefix = None
     if filename:
         if filename_ext:
@@ -271,6 +277,7 @@ def main():
     error = 0
     output_array = []
     for sigmafile in get_inputs(cmdargs.inputs, cmdargs.recurse):
+        print(sigmafile)
         logger.debug("* Processing Sigma input %s" % (sigmafile))
         success = True
         try:
@@ -280,6 +287,7 @@ def main():
                 f = sigmafile.open(encoding='utf-8')
             parser = SigmaCollectionParser(f, sigmaconfigs, rulefilter, sigmafile)
             results = parser.generate(backend)
+
 
             nb_result = len(list(copy.deepcopy(results)))
             inc_filenane = None if nb_result < 2 else 0
@@ -307,7 +315,17 @@ def main():
                         exit(ERR_OUTPUT)
                 if not cmdargs.output_fields:
                     print(result, file=out, end=newline_separator)
-
+                
+                if folder:
+                    simga_directory = pathlib.Path(sigmafile)
+                    config_folder = pathlib.PurePath(simga_directory).parent.name
+                    pathlib.Path(folder+config_folder).mkdir(parents=True, exist_ok=True)
+                    output_file = folder+config_folder+"\\"+simga_directory.stem+'.xml'
+                    print(output_file,"\n")
+                    if result:
+                        out_file = open(output_file, "w", encoding='utf-8')
+                        print(result, file=out_file)
+                
             if cmdargs.output_fields: # Handle output fields
                 output={}
                 f.seek(0)
@@ -351,6 +369,10 @@ def main():
             if not cmdargs.defer_abort:
                 sys.exit(error)
         except NotSupportedError as e:
+            sigma_rules_error.append(sigmafile)
+            with open('error.txt','a') as error_file:
+                error_msg=f"{sigmafile}, Error: {e}\n"
+                error_file.write(error_msg)
             print("Error: The Sigma rule requires a feature that is not supported by the target system: " + str(e), file=sys.stderr)
             logger.debug("* Convertion Sigma input %s FAILURE" % (sigmafile))
             success = False
@@ -367,6 +389,7 @@ def main():
                 if not cmdargs.defer_abort:
                     sys.exit(error)
         except (NotImplementedError, TypeError) as e:
+            print(traceback.format_exc())
             print("An unsupported feature is required for this Sigma rule (%s): " % (sigmafile) + str(e), file=sys.stderr)
             logger.debug("* Convertion Sigma input %s FAILURE" % (sigmafile))
             success = False
@@ -410,7 +433,6 @@ def main():
             print(ruamel.yaml.round_trip_dump(output_array), file=out)
 
     out.close()
-
     sys.exit(error)
 
 if __name__ == "__main__":
